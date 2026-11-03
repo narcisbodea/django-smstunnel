@@ -1,0 +1,3 @@
+{% load i18n %}{% autoescape off %}{% blocktrans trimmed %}
+    Your OTP token is {{ token }}
+{% endblocktrans %}{% endautoescape %}

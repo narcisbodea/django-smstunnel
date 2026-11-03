@@ -1,0 +1,129 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "django-smstunnel"
+dynamic = ["version"]
+description = "SMSTunnel for Django: send texts from your Django app through your own Android phone, from your own number, including django-two-factor-auth sign-in codes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Narcis Bodea", email = "contact@narboweb.ro" }]
+keywords = ["django", "sms", "smstunnel", "android", "text message", "two-factor", "2fa", "otp", "verification code"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Framework :: Django",
+    "Framework :: Django :: 5.2",
+    "Framework :: Django :: 6.0",
+    "Framework :: Django :: 6.1",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Communications :: Telephony",
+    "Typing :: Typed",
+]
+dependencies = [
+    "Django>=5.2",
+    "smstunnel>=1.0,<2",
+]
+
+[project.optional-dependencies]
+# Sign-in codes for django-two-factor-auth (its phone number plugin needs a phone number library).
+two-factor = ["django-two-factor-auth[phonenumberslite]>=1.15"]
+
+[project.urls]
+Homepage = "https://smstunnel.io"
+Documentation = "https://github.com/narcisbodea/django-smstunnel#readme"
+Source = "https://github.com/narcisbodea/django-smstunnel"
+Issues = "https://github.com/narcisbodea/django-smstunnel/issues"
+Changelog = "https://github.com/narcisbodea/django-smstunnel/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+dev = [
+    "django-two-factor-auth[phonenumberslite]>=1.15",
+    "pytest>=8.3",
+    "pytest-django>=4.9",
+    "ruff>=0.12",
+]
+# mypy with the Django stubs (they need Python 3.11 or newer).
+typing = [
+    "django-stubs>=5.2",
+    "mypy>=1.15",
+]
+# Only for the end-to-end tests against a local test server.
+e2e = ["pymongo>=4.10"]
+
+[tool.hatch.version]
+path = "src/django_smstunnel/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/django_smstunnel"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/CHANGELOG.md",
+    "/README.md",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = ["e2e: talks to a real SMSTunnel test server (skipped unless SMSTUNNEL_E2E_KEY_FILE is set)"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests"]
+# The README aligns its comments on purpose.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "B",   # bugbear
+    "C4",  # comprehensions
+    "DJ",  # Django
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "PIE",
+    "PT",  # pytest style
+    "RET",
+    "RUF",
+    "S",   # bandit
+    "SIM",
+    "UP",  # pyupgrade
+    "W",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use assert, fixed test keys and local servers.
+"tests/**" = ["S101", "S105", "S106", "S310"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+files = ["src", "tests"]
+warn_unreachable = true
+plugins = ["mypy_django_plugin.main"]
+
+[tool.django-stubs]
+django_settings_module = "tests.settings"
+
+[[tool.mypy.overrides]]
+module = ["two_factor", "two_factor.*", "phonenumber_field", "phonenumber_field.*", "django_otp", "django_otp.*", "pymongo", "pymongo.*", "bson", "bson.*"]
+ignore_missing_imports = true
