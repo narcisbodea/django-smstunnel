@@ -79,6 +79,8 @@ include = [
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"
+# Lets plain `pytest` import tests.settings (`python -m pytest` adds the folder by itself).
+pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = ["e2e: talks to a real SMSTunnel test server (skipped unless SMSTUNNEL_E2E_KEY_FILE is set)"]
