@@ -134,11 +134,13 @@ Give `send_sms()` a `send_at`, 1 minute to 30 days ahead, and SMSTunnel hands th
 ```python
 from datetime import timedelta
 
+from django.utils import timezone
 from django_smstunnel import cancel_scheduled, send_sms
 
 reminder = send_sms(
     booking.phone,
-    f"Reminder: your appointment is tomorrow at {booking.starts_at:%H:%M}.",
+    # localtime(): with USE_TZ = True the stored value is in UTC; show the hour in your time zone
+    f"Reminder: your appointment is tomorrow at {timezone.localtime(booking.starts_at):%H:%M}.",
     send_at=booking.starts_at - timedelta(days=1),  # aware, as Django's datetimes are with USE_TZ = True
     idempotency_key=f"booking-{booking.pk}-reminder",
 )
