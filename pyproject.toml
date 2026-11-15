@@ -34,7 +34,7 @@ classifiers = [
 ]
 dependencies = [
     "Django>=5.2",
-    "smstunnel>=1.0,<2",
+    "smstunnel>=1.2,<2",
 ]
 
 [project.optional-dependencies]

@@ -129,7 +129,7 @@ def test_an_unusable_idempotency_key_is_refused_before_sending(transport: FakeTr
 
 def test_an_idempotency_key_must_be_text(transport: FakeTransport) -> None:
     with pytest.raises(TypeError):
-        send_sms("+14155550123", "Hello", idempotency_key=1042)  # type: ignore[arg-type]
+        send_sms("+14155550123", "Hello", idempotency_key=1042)  # type: ignore[call-overload]
 
 
 def test_an_empty_number_or_text_is_refused_before_sending(transport: FakeTransport) -> None:

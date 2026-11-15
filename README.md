@@ -17,6 +17,7 @@ SMSTunnel for Django is made by NARBOWEB SRL. It is not affiliated with, endorse
 - [Get your key](#get-your-key)
 - [Setup](#setup)
 - [Send a text](#send-a-text)
+- [Scheduled texts](#scheduled-texts)
 - [Settings](#settings)
 - [Sign-in codes with django-two-factor-auth](#sign-in-codes-with-django-two-factor-auth)
 - [Errors](#errors)
@@ -125,6 +126,33 @@ send_sign_in_code("+14155550123", "Your sign-in code is 482913")
 ```
 
 The text must contain the code, 4 to 10 digits standing on their own (for example `482913` or `123-456`); SMSTunnel refuses it otherwise. Codes count against a separate quota, and the text can be up to 320 characters. Use it for sign-in and verification codes only.
+
+## Scheduled texts
+
+Give `send_sms()` a `send_at`, 1 minute to 30 days ahead, and SMSTunnel hands the text to your phone at that time. It then returns a `ScheduledText` instead of a `SendResult`:
+
+```python
+from datetime import timedelta
+
+from django_smstunnel import cancel_scheduled, send_sms
+
+reminder = send_sms(
+    booking.phone,
+    f"Reminder: your appointment is tomorrow at {booking.starts_at:%H:%M}.",
+    send_at=booking.starts_at - timedelta(days=1),  # aware, as Django's datetimes are with USE_TZ = True
+    idempotency_key=f"booking-{booking.pk}-reminder",
+)
+booking.reminder_id = reminder.id  # keep it to cancel the text
+booking.save(update_fields=["reminder_id"])
+
+cancel_scheduled(booking.reminder_id)  # the booking was canceled while the text still waits
+```
+
+- `send_at` is an aware `datetime` or an ISO 8601 string with an offset. With `USE_TZ = True` (Django's default), a naive `datetime` raises `ValueError` before anything is sent: use `timezone.now() + timedelta(...)`, a `DateTimeField`'s value or `timezone.make_aware()`. With `USE_TZ = False`, a naive `datetime` is local time, in the current time zone, as Django takes it.
+- At that time SMSTunnel sends the text as if your app sent it then, with the same key: it picks the phone then (unless you named one), and the text counts toward that day's allowance. If the phone is offline, the text waits for it up to 3 days.
+- `list_scheduled()` (`"waiting"`, soonest first, or `"done"`) and `cancel_scheduled(id)` work on the texts your project's key scheduled; `alist_scheduled()`, `acancel_scheduled()` and `asend_sms(..., send_at=...)` are for async code, and `get_client().get_scheduled(id)` reads one (`.message_id` once it went out).
+- Sign-in codes can't be scheduled.
+- Refusals: `ApiError` 400 with `error_code` `SCHEDULE_TOO_SOON` or `SCHEDULE_TOO_FAR`, 409 `SCHEDULE_NOT_EDITABLE` when the text to cancel already went out, and `PermissionDeniedError` 403 `SCHEDULE_LIMIT_REACHED` when as many texts wait as your plan allows (10 on Free up to 1000 on Enterprise). `is_retryable()` is `False` for all of them.
 
 ## Settings
 
@@ -295,6 +323,7 @@ Use the django-smstunnel package: `pip install django-smstunnel`, add "django_sm
 API facts:
 - send_sms(to, message, device_id=None, default_country_code=None, idempotency_key=None) calls POST https://smstunnel.io/api/v1/sms/send with the header X-API-Key and the JSON body {"to", "message", "deviceId"?, "defaultCountryCode"?}. It returns result.message_id and result.queued.
 - One recipient per call. To text several people, call it once per number.
+- Scheduled texts: send_sms(..., send_at=booking.starts_at - timedelta(days=1)), 1 minute to 30 days ahead (an aware datetime or an ISO 8601 string with an offset; with USE_TZ = True a naive datetime raises ValueError), returns a ScheduledText (id, send_at, status) instead of a SendResult; cancel_scheduled(id) and list_scheduled() manage them. Not for sign-in codes.
 - send_sign_in_code(...) (POST /api/v1/sms/send-2fa) is only for sign-in codes: the text must contain a code of 4 to 10 digits standing on its own (e.g. 482913 or 123-456), at most 320 characters; it uses a separate quota. For django-two-factor-auth, set TWO_FACTOR_SMS_GATEWAY = "django_smstunnel.two_factor.SmsTunnel".
 - Numbers in international format (+14155550123). default_country_code or the setting SMSTUNNEL_DEFAULT_COUNTRY_CODE (e.g. "+40") completes numbers written without + or 00.
 - Limits: 30 requests a minute per API key, 1600 characters a text.

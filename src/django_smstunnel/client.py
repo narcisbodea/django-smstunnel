@@ -8,24 +8,31 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal, overload
 
 import django
 from asgiref.sync import sync_to_async
+from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.core.signals import setting_changed
 from django.dispatch import receiver
-from smstunnel import ApiError, Client, RateLimitError, SendResult, TransportError
+from django.utils import timezone
+from smstunnel import ApiError, Client, RateLimitError, ScheduledText, ScheduledTexts, SendResult, TransportError
 from smstunnel.transport import HttpRequest, HttpResponse, Transport, UrllibTransport
 
 from ._version import __version__
 from .conf import get_settings
 
 __all__ = [
+    "acancel_scheduled",
+    "alist_scheduled",
     "asend_sign_in_code",
     "asend_sms",
+    "cancel_scheduled",
     "get_client",
     "is_retryable",
+    "list_scheduled",
     "retry_after",
     "send_sign_in_code",
     "send_sms",
@@ -83,6 +90,30 @@ def _settings_changed(*, setting: str, **kwargs: Any) -> None:
         get_client.cache_clear()
 
 
+@overload
+def send_sms(
+    to: str,
+    message: str,
+    *,
+    device_id: str | None = ...,
+    default_country_code: str | None = ...,
+    idempotency_key: str | uuid.UUID | None = ...,
+    send_at: None = ...,
+) -> SendResult: ...
+
+
+@overload
+def send_sms(
+    to: str,
+    message: str,
+    *,
+    device_id: str | None = ...,
+    default_country_code: str | None = ...,
+    idempotency_key: str | uuid.UUID | None = ...,
+    send_at: datetime | str,
+) -> ScheduledText: ...
+
+
 def send_sms(
     to: str,
     message: str,
@@ -90,8 +121,9 @@ def send_sms(
     device_id: str | None = None,
     default_country_code: str | None = None,
     idempotency_key: str | uuid.UUID | None = None,
-) -> SendResult:
-    """Sends one text to one number, from your own phone.
+    send_at: datetime | str | None = None,
+) -> SendResult | ScheduledText:
+    """Sends one text to one number, from your own phone: now, or at ``send_at``.
 
     :param to: the number in international format, e.g. ``"+14155550123"``.
     :param message: up to 1600 characters.
@@ -101,12 +133,19 @@ def send_sms(
     :param idempotency_key: your own id for this text, such as ``f"order-{order.pk}-shipped"``. When the same
         key comes again within 24 hours (a retry after a timeout, a task that ran twice), SMSTunnel answers
         with the first result instead of sending a second text.
+    :param send_at: send it at this time instead of now, 1 minute to 30 days ahead: an aware ``datetime`` (such
+        as ``timezone.now() + timedelta(hours=1)`` or a ``DateTimeField`` with ``USE_TZ = True``) or an ISO 8601
+        string with an offset. With ``USE_TZ = False``, a naive ``datetime`` is local time, as Django takes it: the
+        current time zone. SMSTunnel keeps the text and hands it to your phone then.
     :returns: the result; ``result.queued`` is ``True`` when the phone was offline and sends it once it is back.
+        With ``send_at``, a :class:`smstunnel.ScheduledText` instead (``id``, ``send_at``, ``status``).
     :raises smstunnel.SmsTunnelError: when the text was not accepted (see the README for the subclasses).
     :raises ImproperlyConfigured: when ``SMSTUNNEL_API_KEY`` is missing.
-    :raises ValueError: when the number or the text is empty, or the idempotency key can't be used.
+    :raises ValueError: when the number or the text is empty, the idempotency key can't be used, or ``send_at`` is
+        a naive ``datetime`` while ``USE_TZ`` is on, or a string without an offset.
     """
     key = _checked_key(idempotency_key)
+    when = _aware(send_at)
     conf = get_settings()
     client = get_client()
     with _sending_with(key):
@@ -115,6 +154,7 @@ def send_sms(
             message,
             device_id=_or(device_id, conf.device_id),
             default_country_code=_or(default_country_code, conf.default_country_code),
+            send_at=when,
         )
 
 
@@ -144,6 +184,30 @@ def send_sign_in_code(
         )
 
 
+@overload
+async def asend_sms(
+    to: str,
+    message: str,
+    *,
+    device_id: str | None = ...,
+    default_country_code: str | None = ...,
+    idempotency_key: str | uuid.UUID | None = ...,
+    send_at: None = ...,
+) -> SendResult: ...
+
+
+@overload
+async def asend_sms(
+    to: str,
+    message: str,
+    *,
+    device_id: str | None = ...,
+    default_country_code: str | None = ...,
+    idempotency_key: str | uuid.UUID | None = ...,
+    send_at: datetime | str,
+) -> ScheduledText: ...
+
+
 async def asend_sms(
     to: str,
     message: str,
@@ -151,11 +215,20 @@ async def asend_sms(
     device_id: str | None = None,
     default_country_code: str | None = None,
     idempotency_key: str | uuid.UUID | None = None,
-) -> SendResult:
+    send_at: datetime | str | None = None,
+) -> SendResult | ScheduledText:
     """:func:`send_sms` for async views and tasks (it runs in a worker thread)."""
-    return await sync_to_async(send_sms, thread_sensitive=False)(
-        to, message, device_id=device_id, default_country_code=default_country_code, idempotency_key=idempotency_key
-    )
+    return await sync_to_async(
+        lambda: send_sms(
+            to,
+            message,
+            device_id=device_id,
+            default_country_code=default_country_code,
+            idempotency_key=idempotency_key,
+            send_at=send_at,
+        ),
+        thread_sensitive=False,
+    )()
 
 
 async def asend_sign_in_code(
@@ -170,6 +243,43 @@ async def asend_sign_in_code(
     return await sync_to_async(send_sign_in_code, thread_sensitive=False)(
         to, message, device_id=device_id, default_country_code=default_country_code, idempotency_key=idempotency_key
     )
+
+
+def list_scheduled(
+    scope: Literal["waiting", "done"] = "waiting",
+    *,
+    page: int = 1,
+    limit: int = 50,
+) -> ScheduledTexts:
+    """The texts your project's key scheduled with ``send_sms(..., send_at=...)``: ``"waiting"`` (the default),
+    soonest first, or ``"done"``, the ones that went out, failed or were canceled in the last 30 days.
+
+    ``get_client().get_scheduled(scheduled_id)`` reads one. Needs a key with ``sms:read``.
+    """
+    return get_client().list_scheduled(scope, page=page, limit=limit)
+
+
+def cancel_scheduled(scheduled_id: str) -> ScheduledText:
+    """Cancels a text your project's key scheduled, while it still waits: pass the ``id`` that ``send_sms(...,
+    send_at=...)`` returned. SMSTunnel answers 409 (``error_code`` ``SCHEDULE_NOT_EDITABLE``) when it already went out
+    or was canceled.
+    """
+    return get_client().cancel_scheduled(scheduled_id)
+
+
+async def alist_scheduled(
+    scope: Literal["waiting", "done"] = "waiting",
+    *,
+    page: int = 1,
+    limit: int = 50,
+) -> ScheduledTexts:
+    """:func:`list_scheduled` for async views and tasks (it runs in a worker thread)."""
+    return await sync_to_async(list_scheduled, thread_sensitive=False)(scope, page=page, limit=limit)
+
+
+async def acancel_scheduled(scheduled_id: str) -> ScheduledText:
+    """:func:`cancel_scheduled` for async views and tasks (it runs in a worker thread)."""
+    return await sync_to_async(cancel_scheduled, thread_sensitive=False)(scheduled_id)
 
 
 def is_retryable(error: BaseException) -> bool:
@@ -224,6 +334,19 @@ def _checked_key(value: str | uuid.UUID | None) -> str | None:
             f'"order-1042-shipped" (got {value!r}).'
         )
     return key
+
+
+def _aware(send_at: datetime | str | None) -> datetime | str | None:
+    """``send_at`` as Django means it. With ``USE_TZ = False`` a naive ``datetime`` is local time, so it gets the
+    current time zone; with ``USE_TZ = True`` datetimes are aware, and a naive one is refused rather than guessed."""
+    if not isinstance(send_at, datetime) or not timezone.is_naive(send_at):
+        return send_at
+    if settings.USE_TZ:
+        raise ValueError(
+            "send_at is a naive datetime, but USE_TZ is True, so the moment it means is not known. Use an aware one: "
+            "timezone.now() + timedelta(hours=1), a DateTimeField's value, or timezone.make_aware(value)."
+        )
+    return timezone.make_aware(send_at)
 
 
 def _or(value: str | None, default: str | None) -> str | None:
