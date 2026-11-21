@@ -1,6 +1,6 @@
 # SMSTunnel for Django
 
-`django-smstunnel`: send texts from your Django app through **your own Android phone**, from **your own number**, with [SMSTunnel](https://smstunnel.io). It also sends django-two-factor-auth's sign-in codes.
+`django-smstunnel`: send texts from your Django app through **your own Android phone**, from **your own number**, with [SMSTunnel](https://smstunnel.io). It also sends the sign-in codes of django-allauth, django-otp, django-two-factor-auth and django-phone-verify.
 
 Your app hands each text to your SMSTunnel account and your phone sends it from its own SIM, so recipients see a number they know and can reply to. The phone is linked to your account when you sign in to the SMSTunnel app, and you can cut your app off at any time by deleting its API key in your dashboard.
 
@@ -8,7 +8,7 @@ Your phone needs the SMSTunnel app from Google Play:
 
 <a href="https://play.google.com/store/apps/details?id=io.smstunnel.app"><img src="https://smstunnel.io/google-play-badge.png" alt="Get it on Google Play" height="56"></a>
 
-SMSTunnel for Django is made by NARBOWEB SRL. It is not affiliated with, endorsed by, or sponsored by the Django Software Foundation or the django-two-factor-auth project (Jazzband). Django is a registered trademark of the Django Software Foundation.
+SMSTunnel for Django is made by NARBOWEB SRL. It is not affiliated with, endorsed by, or sponsored by the Django Software Foundation or the django-two-factor-auth (Jazzband), django-allauth, django-otp or django-phone-verify projects. Django is a registered trademark of the Django Software Foundation.
 
 ## Contents
 
@@ -20,6 +20,7 @@ SMSTunnel for Django is made by NARBOWEB SRL. It is not affiliated with, endorse
 - [Scheduled texts](#scheduled-texts)
 - [Settings](#settings)
 - [Sign-in codes with django-two-factor-auth](#sign-in-codes-with-django-two-factor-auth)
+- [Phone sign-in: django-allauth, django-otp, django-phone-verify](#phone-sign-in-django-allauth-django-otp-django-phone-verify)
 - [Errors](#errors)
 - [Background tasks and retries](#background-tasks-and-retries)
 - [Status, phones and usage](#status-phones-and-usage)
@@ -44,6 +45,8 @@ For django-two-factor-auth sign-in codes, install it with the extra (it brings d
 ```bash
 pip install "django-smstunnel[two-factor]"
 ```
+
+For the other sign-in packages, use the extra `allauth`, `otp` or `phone-verify` (see [Phone sign-in](#phone-sign-in-django-allauth-django-otp-django-phone-verify)). None of them is needed for anything else in this package.
 
 ## Get your key
 
@@ -165,6 +168,12 @@ cancel_scheduled(booking.reminder_id)  # the booking was canceled while the text
 | `SMSTUNNEL_DEFAULT_COUNTRY_CODE` | `None` | Completes numbers written without `+` or `00`, e.g. `"+40"` (`"40"` and `"0040"` work too). It always wins over the phone's own country. |
 | `SMSTUNNEL_BASE_URL` | `"https://smstunnel.io"` | Change it only for a test server. |
 | `SMSTUNNEL_TIMEOUT` | `30` | Seconds for each request. |
+| `SMSTUNNEL_SIGNIN_LIMITS` | see [Limits](#limits) | How many sign-in codes may go out per number, per IP and for the whole project. |
+| `SMSTUNNEL_CLIENT_IP` | `None` | A function (or its dotted path) that takes the request and returns the visitor's IP, for a site behind a proxy. |
+| `SMSTUNNEL_SIGNIN_BACKGROUND` | `True` | Public sign-in forms answer before the text is sent. Turn it off only on platforms that stop the process after each answer. |
+| `SMSTUNNEL_OTP_TOKEN_VALIDITY` | `300` | Seconds a django-otp code works. |
+| `SMSTUNNEL_OTP_COOLDOWN` | `60` | Seconds before a django-otp device can send a new code. |
+| `SMSTUNNEL_OTP_THROTTLE_FACTOR` | `1` | Seconds to wait after a wrong django-otp code, doubling each time. |
 
 Changing a setting in a test with `override_settings` takes effect at once.
 
@@ -200,6 +209,151 @@ It is translated with django-two-factor-auth's own translations, in the user's l
 Phone calls are not supported: leave `TWO_FACTOR_CALL_GATEWAY` unset (the system check warns when it points at SMSTunnel). The `SMSTUNNEL_DEVICE_ID` and `SMSTUNNEL_DEFAULT_COUNTRY_CODE` settings apply to these codes too.
 
 Every request for a code sends a text. If a double click should not send the same code twice, subclass `SmsTunnel`, return a key from `idempotency_key(self, device, token)` (for example `f"sign-in-{device.persistent_id}-{token}"`) and point `TWO_FACTOR_SMS_GATEWAY` at your class.
+
+## Phone sign-in: django-allauth, django-otp, django-phone-verify
+
+> **A text message is a weaker factor than an authenticator app or a passkey.** A number can be moved to another SIM, and texts can be read on the way. Offer it as an optional factor, never as the only factor on an account that matters, and never as the way to recover a password.
+
+All three send through `POST /api/v1/sms/send-2fa`, so codes use their own allowance. For every code, this package:
+
+- refuses a number that isn't in international format (`+` and the country code) before any request;
+- applies the [limits](#limits), so a public form can't be used to drain your SIM;
+- sends once and never retries on its own. After a timeout the text may already have gone out, so a second one is sent only when the person asks for a new code;
+- logs what went wrong without the number, the code or the key.
+
+SMSTunnel can confirm that your phone sent the text, not that it arrived.
+
+### django-allauth
+
+Needs django-allauth 65.15 or newer (65.20 and later need Python 3.11).
+
+```bash
+pip install "django-smstunnel[allauth]"
+```
+
+allauth asks your project for a sender and for four methods that say where the number is kept. The mixin is the sender:
+
+```python
+# accounts/adapter.py
+from allauth.account.adapter import DefaultAccountAdapter
+from django_smstunnel.allauth import SmsTunnelAccountAdapterMixin
+
+from .models import UserPhone  # user (one-to-one), number (unique), verified
+
+
+class AccountAdapter(SmsTunnelAccountAdapterMixin, DefaultAccountAdapter):  # the mixin comes first
+    def set_phone(self, user, phone, verified):
+        UserPhone.objects.update_or_create(user=user, defaults={"number": phone, "verified": verified})
+
+    def get_phone(self, user):
+        stored = UserPhone.objects.filter(user=user).first()
+        return (stored.number, stored.verified) if stored else None
+
+    def set_phone_verified(self, user, phone):
+        UserPhone.objects.filter(user=user, number=phone).update(verified=True)
+
+    def get_user_by_phone(self, phone):
+        stored = UserPhone.objects.filter(number=phone).select_related("user").first()
+        return stored.user if stored else None
+```
+
+```python
+# settings.py
+ACCOUNT_ADAPTER = "accounts.adapter.AccountAdapter"
+ACCOUNT_LOGIN_METHODS = {"phone"}
+ACCOUNT_SIGNUP_FIELDS = ["phone*", "username*", "password1*", "password2*"]
+ACCOUNT_LOGIN_BY_CODE_ENABLED = True
+```
+
+People can then sign in at `/accounts/login/code/`. With login by code, the text alone signs them in, so keep it for accounts where that risk is acceptable, or add a second factor with `allauth.mfa`.
+
+- **A number with no account gets no text**, and the page can't tell the two apart: same answer, same timing. A failed send looks the same too, so check your log. Leave `ACCOUNT_PREVENT_ENUMERATION` on (the default); `manage.py check` warns if it's off.
+- **Codes are 6 digits**, because SMSTunnel's sign-in route needs 4 to 10 digits and allauth's default has letters. For another length, set `ACCOUNT_PHONE_VERIFICATION_CODE_FORMAT = {"numeric": True, "length": 8, "dashed": False}`.
+- To change the words, put your own `templates/django_smstunnel/signin/code.txt` in your project. It gets `code`, which must stand on its own.
+
+### django-otp
+
+```bash
+pip install "django-smstunnel[otp]"
+```
+
+```python
+# settings.py
+INSTALLED_APPS = [
+    # ...
+    "django_otp",
+    "django_smstunnel",
+    "django_smstunnel.otp",
+]
+MIDDLEWARE = [
+    # ...
+    "django_otp.middleware.OTPMiddleware",
+    "django_smstunnel.signin.ClientIPMiddleware",  # for the limit per IP
+]
+```
+
+Run `python manage.py migrate`. `SmsTunnelDevice` then works with django-otp's forms, views and admin. To add a phone, confirm it with a code first:
+
+```python
+from django_smstunnel.otp.models import CodeNotSentError, SmsTunnelDevice
+
+device = SmsTunnelDevice(user=request.user, name="My phone", number=number, confirmed=False)
+device.full_clean()  # refuses a number that isn't in international format
+device.save()
+
+try:
+    device.generate_challenge()  # texts a code
+except CodeNotSentError as error:
+    messages.error(request, str(error))  # safe to show
+
+# Later, with the code the person typed:
+if device.verify_token(code):
+    device.confirmed = True
+    device.save(update_fields=["confirmed"])
+```
+
+A code works once and for 5 minutes. A new one can be sent after 60 seconds, and wrong codes make the next try wait longer each time.
+
+### django-phone-verify
+
+Needs django-phone-verify 3.3. It can't be installed next to the `two-factor` extra, because the two need different major versions of `phonenumbers`. django-phone-verify is under the GPL 3.0, so check that this suits your project; this package includes none of its code.
+
+```bash
+pip install "django-smstunnel[phone-verify]"
+```
+
+```python
+# settings.py
+PHONE_VERIFICATION = {
+    "BACKEND": "django_smstunnel.phone_verify.SmsTunnelBackend",
+    "OPTIONS": {},
+    "TOKEN_LENGTH": 6,  # 4 to 10
+    "MESSAGE": "Your {app} code is {security_code}",
+    "APP_NAME": "Example",
+    "SECURITY_CODE_EXPIRATION_SECONDS": 600,
+    "VERIFY_SECURITY_CODE_ONLY_ONCE": True,
+}
+MIDDLEWARE = [
+    # ...
+    "django_smstunnel.signin.ClientIPMiddleware",  # its register endpoint is public and takes any number
+]
+```
+
+### Limits
+
+```python
+# settings.py: these are the defaults
+SMSTUNNEL_SIGNIN_LIMITS = {
+    "number": "5/h,10/d",     # per phone number
+    "ip": "20/h,100/d",       # per visitor's IP (an IPv6 visitor counts as its /64)
+    "total": "100/h,300/d",   # for the whole project: what stops many numbers from many addresses
+}
+```
+
+Write a rate like `3/15m`, `5/h` or `10/d`, and `None` to turn one limit off. When a limit is reached, no text goes out, the page doesn't change, and a warning goes to the `django_smstunnel.signin` log.
+
+- **Use a cache shared by your workers** (Redis, Memcached or the database). With Django's default local-memory cache each worker counts on its own. With `DummyCache` nothing is counted, and `manage.py check` warns. If the cache is down, no code is sent.
+- **Behind a proxy**, tell it where the visitor's IP is, with `SMSTUNNEL_CLIENT_IP = "myproject.utils.client_ip"` (with django-allauth, `ALLAUTH_TRUSTED_PROXY_COUNT` is enough). Until then the limit per IP is skipped, because every visitor would seem to come from the proxy. The other two limits still apply.
 
 ## Errors
 
@@ -327,6 +481,7 @@ API facts:
 - One recipient per call. To text several people, call it once per number.
 - Scheduled texts: send_sms(..., send_at=booking.starts_at - timedelta(days=1)), 1 minute to 30 days ahead (an aware datetime or an ISO 8601 string with an offset; with USE_TZ = True a naive datetime raises ValueError), returns a ScheduledText (id, send_at, status) instead of a SendResult; cancel_scheduled(id) and list_scheduled() manage them. Not for sign-in codes.
 - send_sign_in_code(...) (POST /api/v1/sms/send-2fa) is only for sign-in codes: the text must contain a code of 4 to 10 digits standing on its own (e.g. 482913 or 123-456), at most 320 characters; it uses a separate quota. For django-two-factor-auth, set TWO_FACTOR_SMS_GATEWAY = "django_smstunnel.two_factor.SmsTunnel".
+- For phone sign-in, use what the package ships instead of calling it yourself: django_smstunnel.allauth.SmsTunnelAccountAdapterMixin (django-allauth), the app django_smstunnel.otp with SmsTunnelDevice (django-otp), django_smstunnel.phone_verify.SmsTunnelBackend (django-phone-verify). They limit codes per number and per IP (SMSTUNNEL_SIGNIN_LIMITS). A text is a weaker factor than an authenticator app or a passkey: never make it the only factor on an account that matters, or the way to recover a password.
 - Numbers in international format (+14155550123). default_country_code or the setting SMSTUNNEL_DEFAULT_COUNTRY_CODE (e.g. "+40") completes numbers written without + or 00.
 - Limits: 30 requests a minute per API key, 1600 characters a text.
 - idempotency_key is sent as the Idempotency-Key header: a retry with the same key within 24 hours gets the first answer instead of sending a second text. Never retry a send after a timeout, a 5xx or a 429 unless it carries a key.
@@ -354,6 +509,10 @@ pip install -e . --group dev        # pip 25.1 or newer
 pytest                              # unit tests (HTTP is faked)
 ruff check . && ruff format --check .
 pip install --group typing && mypy  # strict, with the Django stubs (Python 3.11 or newer)
+
+# With the real sign-in packages. django-phone-verify needs its own environment:
+pip install --group signin && pytest --ds=tests.settings_signin tests/signin
+pip install -e . --group signin-phone-verify && pytest --ds=tests.settings_signin tests/signin
 ```
 
 The end-to-end tests run only against a test server, never production. They read the server address and a test key from a JSON file (`{"serverUrl": "http://127.0.0.1:3141", "apiKey": "...", "deviceId": "..."}`) and, when `SMSTUNNEL_E2E_MONGO_URL` is set, check each text in the server's database:

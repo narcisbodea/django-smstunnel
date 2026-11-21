@@ -3,6 +3,28 @@
 All notable changes to `django-smstunnel` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - Unreleased
+
+Everything here is optional: a project that doesn't use it runs as with 1.1, and the package still imports without
+these hosts installed.
+
+### Added
+
+- **django-allauth phone sign-in:** `django_smstunnel.allauth.SmsTunnelAccountAdapterMixin` (65.15 or newer). Codes are
+  digits. A number with no account gets no text, and neither the page nor its timing shows whether a number has one.
+- **django-otp:** the app `django_smstunnel.otp` with `SmsTunnelDevice`, an optional factor that texts its codes, with
+  a cooldown and django-otp's back-off after wrong codes. It has its own migration.
+- **django-phone-verify:** `django_smstunnel.phone_verify.SmsTunnelBackend` (3.3 or newer).
+- `django_smstunnel.signin`, what they share: `send_code()` refuses numbers that aren't in international format before
+  any request, never retries, and logs no number, code or key.
+- **Limits on sign-in codes** per number, per IP and for the project (`SMSTUNNEL_SIGNIN_LIMITS`), with
+  `ClientIPMiddleware` and `SMSTUNNEL_CLIENT_IP` to find the visitor's IP.
+- Extras `allauth`, `otp` and `phone-verify`. Settings `SMSTUNNEL_SIGNIN_BACKGROUND` and `SMSTUNNEL_OTP_*`.
+- System checks for these integrations, silent in a project that uses none of them: `smstunnel.E002` (a limit it can't
+  read), `E003` (the mixin after `DefaultAccountAdapter`), `E004` (a django-phone-verify code length it can't send),
+  `W004` (enumeration prevention off), `W005` (a code format that can't be texted), `W006` (a cache that counts
+  nothing) and `W007` (django-phone-verify without `ClientIPMiddleware`).
+
 ## [1.1.0] - 2026-11-15
 
 ### Added
