@@ -15,6 +15,7 @@ from django.test import Client, override_settings
 from django.urls import reverse
 from smstunnel import TransportError
 
+from django_smstunnel import signin
 from django_smstunnel.checks import check_signin
 
 from ..support import FakeTransport, error
@@ -153,9 +154,7 @@ def test_the_answer_does_not_wait_for_the_send(
     assert answer.status_code == 302
     assert transport.requests == [], "The page must answer before the text goes out."
     release.set()
-    for thread in threading.enumerate():
-        if thread.name == "django-smstunnel-code":
-            thread.join(10)
+    assert signin._pool.drain(10)
     assert len(transport.requests) == 1
 
 
@@ -190,6 +189,17 @@ def test_the_ip_limit_applies(member: Any, transport: FakeTransport) -> None:
 
     Client(REMOTE_ADDR="203.0.113.8").post(reverse("account_request_login_code"), {"phone": KNOWN})
     assert len(transport.requests) == 2
+
+
+@override_settings(CACHES={"default": {"BACKEND": "django.core.cache.backends.dummy.DummyCache"}})
+def test_a_cache_that_keeps_nothing_sends_nothing_and_the_page_does_not_change(
+    member: Any, transport: FakeTransport
+) -> None:
+    known = request_code(Client(), KNOWN)
+    unknown = request_code(Client(), UNKNOWN)
+
+    assert visible(known) == visible(unknown)
+    assert transport.requests == []
 
 
 def test_codes_are_six_digits_by_default() -> None:

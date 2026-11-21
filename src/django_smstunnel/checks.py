@@ -100,17 +100,18 @@ def check_signin(app_configs: Sequence[AppConfig] | None = None, **kwargs: Any) 
     from .signin import limits
 
     messages: list[CheckMessage] = []
+    rates: dict[str, Any] = {}
     try:
-        limits()
+        rates = limits()
     except ImproperlyConfigured as error:
         messages.append(Error(str(error), id="smstunnel.E002"))
 
     cache_backend = str(settings.CACHES.get("default", {}).get("BACKEND", ""))
-    if cache_backend.endswith("DummyCache"):
+    if cache_backend.endswith("DummyCache") and any(rates.values()):
         messages.append(
             Warning(
-                "The default cache is DummyCache, so the sign-in code limits per number, per IP and for the project "
-                "count nothing.",
+                "The default cache is DummyCache, which keeps nothing, so the sign-in code limits can't be counted "
+                "and no sign-in code will be sent.",
                 hint="Use a real cache, shared between your workers (Redis, Memcached or the database).",
                 id="smstunnel.W006",
             )

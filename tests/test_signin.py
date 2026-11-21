@@ -5,16 +5,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from django.core.cache import cache
 from django.core.checks import Error
 from django.core.exceptions import ImproperlyConfigured
+from django.core.management import call_command
 from django.http import HttpRequest, HttpResponse
 from django.test import RequestFactory, override_settings
 from smstunnel import TransportError
@@ -183,9 +188,7 @@ def test_a_failed_background_send_is_only_logged(transport: FakeTransport, caplo
 
     with caplog.at_level(logging.ERROR, logger="django_smstunnel.signin"):
         assert send_code(NUMBER, TEXT, background=True) is CodeResult.BACKGROUND
-        for thread in threading.enumerate():
-            if thread.name == "django-smstunnel-code":
-                thread.join(5)
+        assert signin._pool.drain(5)
 
     assert "HTTP 401" in caplog.text
 
@@ -194,10 +197,186 @@ def test_when_no_thread_can_start_nothing_is_sent(monkeypatch: pytest.MonkeyPatc
     def refuse(self: threading.Thread) -> None:
         raise RuntimeError("can't start new thread")
 
+    monkeypatch.setattr(signin, "_pool", signin._SendPool())
     monkeypatch.setattr(threading.Thread, "start", refuse)
 
     assert send_code(NUMBER, TEXT, background=True) is CodeResult.FAILED
     assert transport.requests == []
+
+
+# The bounded worker pool
+
+
+NO_LIMITS: dict[str, str | None] = {"number": None, "ip": None, "total": None}
+
+
+def nth_number(index: int) -> str:
+    return f"+1415555{index:04d}"
+
+
+@pytest.fixture
+def held_sends(monkeypatch: pytest.MonkeyPatch, transport: FakeTransport) -> Iterator[SimpleNamespace]:
+    """A fresh pool whose sends wait until released, like an API that stopped answering."""
+    entered = threading.Semaphore(0)
+    release = threading.Event()
+    real = transport.send
+
+    def held(request: Any) -> Any:
+        entered.release()
+        release.wait(30)
+        return real(request)
+
+    monkeypatch.setattr(transport, "send", held)
+    monkeypatch.setattr(signin, "_pool", signin._SendPool())
+    yield SimpleNamespace(entered=entered, release=release)
+    release.set()
+    assert signin._pool.drain(10)
+
+
+def fill_the_pool(held: SimpleNamespace) -> None:
+    """Every worker busy and the queue full."""
+    for index in range(signin._WORKERS):
+        assert send_code(nth_number(index), TEXT, background=True) is CodeResult.BACKGROUND
+    for _ in range(signin._WORKERS):
+        assert held.entered.acquire(timeout=5)
+    for index in range(signin._QUEUE_SIZE):
+        assert send_code(nth_number(1000 + index), TEXT, background=True) is CodeResult.BACKGROUND
+
+
+@override_settings(SMSTUNNEL_SIGNIN_LIMITS=NO_LIMITS)
+def test_a_flood_uses_a_fixed_number_of_threads(held_sends: SimpleNamespace, transport: FakeTransport) -> None:
+    before = threading.active_count()
+
+    fill_the_pool(held_sends)
+    results = [send_code(nth_number(index), TEXT, background=True) for index in range(2000, 2500)]
+
+    assert set(results) == {CodeResult.LIMITED}
+    assert threading.active_count() == before + signin._WORKERS
+    held_sends.release.set()
+    assert signin._pool.drain(10)
+    assert len(transport.requests) == signin._WORKERS + signin._QUEUE_SIZE, "What was refused is never sent later."
+
+
+@override_settings(SMSTUNNEL_SIGNIN_LIMITS=NO_LIMITS)
+def test_a_full_queue_never_makes_the_visitor_wait(held_sends: SimpleNamespace) -> None:
+    fill_the_pool(held_sends)
+
+    started = time.monotonic()
+    for _ in range(200):
+        send_code(NUMBER, TEXT, background=True)
+
+    assert time.monotonic() - started < 1
+
+
+@override_settings(SMSTUNNEL_SIGNIN_LIMITS=NO_LIMITS)
+def test_a_full_queue_tells_the_owner_without_flooding_the_log(
+    held_sends: SimpleNamespace, caplog: pytest.LogCaptureFixture
+) -> None:
+    fill_the_pool(held_sends)
+
+    with caplog.at_level(logging.ERROR, logger="django_smstunnel.signin"):
+        for _ in range(50):
+            send_code(NUMBER, TEXT, background=True)
+        signin._pool._last_report = -signin._FULL_LOG_EVERY  # A minute later.
+        send_code(NUMBER, TEXT, background=True)
+
+    lines = [record.getMessage() for record in caplog.records if "waiting to go out" in record.getMessage()]
+    assert [line.split(" sign-in")[0] for line in lines] == ["SMSTunnel: 1", "SMSTunnel: 50"]
+    assert NUMBER not in caplog.text
+    assert "482913" not in caplog.text
+
+
+@override_settings(SMSTUNNEL_SIGNIN_LIMITS=NO_LIMITS)
+def test_a_worker_survives_an_unexpected_failure(monkeypatch: pytest.MonkeyPatch, transport: FakeTransport) -> None:
+    monkeypatch.setattr(signin, "_pool", signin._SendPool())
+    real = signin._limit_and_deliver
+    calls: list[str] = []
+
+    def fails_once(to: str, text: str, ip: str | None) -> CodeResult:
+        calls.append(to)
+        if len(calls) == 1:
+            raise KeyError(to)
+        return real(to, text, ip)
+
+    monkeypatch.setattr(signin, "_limit_and_deliver", fails_once)
+    send_code(NUMBER, TEXT, background=True)
+    send_code(NUMBER, TEXT, background=True)
+
+    assert signin._pool.drain(5)
+    assert len(calls) == 2
+    assert len(transport.requests) == 1
+    assert all(worker.is_alive() for worker in signin._pool._workers)
+
+
+PROCESS_SETUP = """
+import os, time
+import django
+from django.conf import settings
+settings.configure(SECRET_KEY="x" * 50, SMSTUNNEL_API_KEY="sk_test_unit", SMSTUNNEL_BASE_URL="https://smstunnel.test")
+django.setup()
+from django_smstunnel import client, signin
+from tests.support import sent
+NUMBER, TEXT = "+14155550123", "Your sign-in code is 482913"
+"""
+
+
+def in_a_new_process(body: str) -> list[str]:
+    command = [sys.executable, "-c", PROCESS_SETUP + body]
+    root = Path(__file__).resolve().parent.parent
+    done = subprocess.run(command, capture_output=True, text=True, check=True, cwd=root, timeout=20)  # noqa: S603
+    return done.stdout.split()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="Needs os.fork.")
+def test_a_forked_process_does_not_inherit_the_queue() -> None:
+    output = in_a_new_process(
+        """
+parent = signin._pool
+parent._queue.put_nowait((NUMBER, TEXT, None))
+pid = os.fork()
+if pid == 0:
+    os._exit(0 if signin._pool is not parent and signin._pool._queue.empty() else 1)
+print(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
+parent._queue.get_nowait()
+parent._queue.task_done()
+"""
+    )
+
+    assert output == ["0"]
+
+
+def test_a_code_in_flight_when_the_process_exits_still_goes_out() -> None:
+    output = in_a_new_process(
+        """
+class Slow:
+    def send(self, request):
+        time.sleep(0.3)
+        print("sent", flush=True)
+        return sent()
+client._make_transport = Slow
+print(signin.send_code(NUMBER, TEXT, background=True).value, flush=True)
+"""
+    )
+
+    assert output == ["background", "sent"]
+
+
+def test_a_hung_send_does_not_hold_up_the_exit() -> None:
+    started = time.monotonic()
+
+    output = in_a_new_process(
+        """
+signin._EXIT_WAIT = 0.2
+class Hung:
+    def send(self, request):
+        time.sleep(60)
+client._make_transport = Hung
+print(signin.send_code(NUMBER, TEXT, background=True).value, flush=True)
+"""
+    )
+
+    assert output == ["background"]
+    assert time.monotonic() - started < 15
 
 
 # Limits
@@ -305,6 +484,143 @@ def test_a_limit_it_cannot_read_is_an_error(value: Any) -> None:
         limits()
 
 
+# A forged X-Forwarded-For
+
+FORGED_HEADERS: dict[str, Callable[[int], dict[str, str]]] = {
+    "no header": lambda index: {},
+    "a fixed value": lambda index: {"HTTP_X_FORWARDED_FOR": "8.8.4.4"},
+    "a new value each time": lambda index: {"HTTP_X_FORWARDED_FOR": f"8.8.{index}.4"},
+    "a chain": lambda index: {"HTTP_X_FORWARDED_FOR": f"1.1.1.{index}, 8.8.8.8"},
+    "not an address": lambda index: {"HTTP_X_FORWARDED_FOR": "evil"},
+    "empty": lambda index: {"HTTP_X_FORWARDED_FOR": ""},
+    "very long": lambda index: {"HTTP_X_FORWARDED_FOR": "9.9.9.9, " * 500},
+}
+PEERS = ["10.0.0.5", "127.0.0.1", "::1", "::ffff:10.0.0.5", "100.64.0.5", "8.8.8.8", "::ffff:8.8.8.8"]
+
+
+def through_the_site(peer: str, forged: str, numbers: list[str]) -> list[CodeResult]:
+    """One request per number, from ``peer``, each with the forged header."""
+    results: list[CodeResult] = []
+    remaining = iter(numbers)
+
+    def view(request: HttpRequest) -> HttpResponse:
+        results.append(send_code(next(remaining), TEXT))
+        return HttpResponse()
+
+    middleware = ClientIPMiddleware(view)
+    for index in range(len(numbers)):
+        middleware(request_from(peer, **FORGED_HEADERS[forged](index)))
+    return results
+
+
+@pytest.mark.parametrize("peer", PEERS)
+@pytest.mark.parametrize("forged", FORGED_HEADERS)
+def test_a_forged_header_never_changes_the_limit_per_number(transport: FakeTransport, peer: str, forged: str) -> None:
+    with override_settings(SMSTUNNEL_SIGNIN_LIMITS={"number": "2/h", "ip": "50/h", "total": None}):
+        results = through_the_site(peer, forged, [NUMBER] * 6)
+
+    assert results == [CodeResult.SENT] * 2 + [CodeResult.LIMITED] * 4
+    assert len(transport.requests) == 2
+
+
+@pytest.mark.parametrize("peer", PEERS)
+@pytest.mark.parametrize("forged", FORGED_HEADERS)
+def test_a_forged_header_never_changes_the_project_limit(transport: FakeTransport, peer: str, forged: str) -> None:
+    with override_settings(SMSTUNNEL_SIGNIN_LIMITS={"number": None, "ip": "50/h", "total": "3/h"}):
+        results = through_the_site(peer, forged, [nth_number(index) for index in range(6)])
+
+    assert results == [CodeResult.SENT] * 3 + [CodeResult.LIMITED] * 3
+    assert len(transport.requests) == 3
+
+
+@pytest.mark.parametrize("peer", ["8.8.8.8", "::ffff:8.8.8.8"])
+@pytest.mark.parametrize("forged", ["a fixed value", "a new value each time", "a chain"])
+def test_from_a_public_address_a_header_cant_escape_the_ip_limit(
+    transport: FakeTransport, peer: str, forged: str
+) -> None:
+    with override_settings(SMSTUNNEL_SIGNIN_LIMITS={"number": None, "ip": "1/h", "total": None}):
+        results = through_the_site(peer, forged, [nth_number(index) for index in range(3)])
+
+    assert results == [CodeResult.SENT, CodeResult.LIMITED, CodeResult.LIMITED]
+
+
+def test_from_a_private_address_the_ip_limit_is_off_and_the_log_says_so(
+    transport: FakeTransport, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(signin, "_warned_about_proxy", False)
+
+    with (
+        override_settings(SMSTUNNEL_SIGNIN_LIMITS={"number": None, "ip": "1/h", "total": None}),
+        caplog.at_level(logging.WARNING, logger="django_smstunnel.signin"),
+    ):
+        results = through_the_site("10.0.0.5", "a fixed value", [nth_number(index) for index in range(3)])
+
+    assert results == [CodeResult.SENT] * 3
+    assert caplog.text.count("the per-IP limit on sign-in codes is OFF") == 1
+    assert "until you set SMSTUNNEL_CLIENT_IP" in caplog.text
+
+
+def test_setting_the_client_ip_turns_the_ip_limit_back_on(transport: FakeTransport) -> None:
+    with override_settings(
+        SMSTUNNEL_SIGNIN_LIMITS={"number": None, "ip": "1/h", "total": None},
+        SMSTUNNEL_CLIENT_IP=lambda request: "8.8.8.8",
+    ):
+        results = through_the_site("10.0.0.5", "a new value each time", [nth_number(index) for index in range(3)])
+
+    assert results == [CodeResult.SENT, CodeResult.LIMITED, CodeResult.LIMITED]
+
+
+# A cache that keeps nothing
+
+DUMMY_CACHE = {"default": {"BACKEND": "django.core.cache.backends.dummy.DummyCache"}}
+
+
+@override_settings(CACHES=DUMMY_CACHE)
+def test_a_cache_that_keeps_nothing_sends_nothing(transport: FakeTransport, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.ERROR, logger="django_smstunnel.signin"):
+        assert send_code(NUMBER, TEXT) is CodeResult.FAILED
+
+    assert transport.requests == []
+    assert "the cache keeps nothing" in caplog.text
+    assert NUMBER not in caplog.text
+
+
+@override_settings(CACHES=DUMMY_CACHE, SMSTUNNEL_SIGNIN_LIMITS=NO_LIMITS)
+def test_with_every_limit_off_no_counter_is_needed(transport: FakeTransport) -> None:
+    assert send_code(NUMBER, TEXT) is CodeResult.SENT
+
+
+@override_settings(CACHES=DUMMY_CACHE, SMSTUNNEL_SIGNIN_LIMITS={})
+def test_a_cache_that_keeps_nothing_leaves_manage_py_working(capsys: pytest.CaptureFixture[str]) -> None:
+    call_command("check")
+
+    assert "smstunnel.W006" in capsys.readouterr().err
+
+
+@override_settings(CACHES=DUMMY_CACHE, SMSTUNNEL_SIGNIN_LIMITS=NO_LIMITS)
+def test_no_w006_when_there_is_nothing_to_count() -> None:
+    assert check_signin() == []
+
+
+def test_a_counter_that_expires_while_counting_still_counts(
+    transport: FakeTransport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = cache.incr
+    calls: list[str] = []
+
+    def expired_once(key: str, *args: Any, **kwargs: Any) -> int:
+        calls.append(key)
+        if len(calls) == 1:
+            cache.delete(key)
+            raise ValueError("gone")
+        return real(key, *args, **kwargs)
+
+    monkeypatch.setattr(cache, "incr", expired_once)
+
+    assert send_code(NUMBER, TEXT) is CodeResult.SENT
+    assert cache.get(calls[0]) == 1
+
+
 # The visitor's IP
 
 
@@ -319,6 +635,14 @@ def test_a_forged_forwarded_header_changes_nothing_on_a_direct_connection() -> N
 @pytest.mark.parametrize("proxy", ["127.0.0.1", "10.0.0.5", "192.168.1.1", "::1"])
 def test_behind_a_local_proxy_the_ip_is_unknown_rather_than_shared(proxy: str) -> None:
     assert client_ip(request_from(proxy, HTTP_X_FORWARDED_FOR="198.51.100.9")) is None
+
+
+@pytest.mark.parametrize(
+    ("peer", "counted"),
+    [("::ffff:8.8.8.8", "8.8.8.8"), ("::ffff:10.0.0.5", None), ("100.64.0.5", None), ("fd00::1", None)],
+)
+def test_what_counts_as_a_private_peer(peer: str, counted: str | None) -> None:
+    assert client_ip(request_from(peer, HTTP_X_FORWARDED_FOR="1.1.1.1")) == counted
 
 
 def test_a_private_address_without_a_proxy_counts() -> None:

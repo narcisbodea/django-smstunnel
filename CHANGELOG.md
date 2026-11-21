@@ -18,12 +18,15 @@ these hosts installed.
 - `django_smstunnel.signin`, what they share: `send_code()` refuses numbers that aren't in international format before
   any request, never retries, and logs no number, code or key.
 - **Limits on sign-in codes** per number, per IP and for the project (`SMSTUNNEL_SIGNIN_LIMITS`), with
-  `ClientIPMiddleware` and `SMSTUNNEL_CLIENT_IP` to find the visitor's IP.
+  `ClientIPMiddleware` and `SMSTUNNEL_CLIENT_IP` to find the visitor's IP. Behind a proxy, the limit per IP is off
+  until `SMSTUNNEL_CLIENT_IP` is set. A cache that keeps nothing (`DummyCache`) means no code is sent.
+- Public forms send through 4 worker threads and a queue of 32 per process. When it is full, nothing is sent and
+  the page doesn't change.
 - Extras `allauth`, `otp` and `phone-verify`. Settings `SMSTUNNEL_SIGNIN_BACKGROUND` and `SMSTUNNEL_OTP_*`.
 - System checks for these integrations, silent in a project that uses none of them: `smstunnel.E002` (a limit it can't
   read), `E003` (the mixin after `DefaultAccountAdapter`), `E004` (a django-phone-verify code length it can't send),
-  `W004` (enumeration prevention off), `W005` (a code format that can't be texted), `W006` (a cache that counts
-  nothing) and `W007` (django-phone-verify without `ClientIPMiddleware`).
+  `W004` (enumeration prevention off), `W005` (a code format that can't be texted), `W006` (a cache that keeps
+  nothing, so no code is sent) and `W007` (django-phone-verify without `ClientIPMiddleware`).
 
 ## [1.1.0] - 2026-11-15
 

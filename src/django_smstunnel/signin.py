@@ -15,9 +15,12 @@ before.
 
 from __future__ import annotations
 
+import atexit
 import enum
 import ipaddress
 import logging
+import os
+import queue
 import re
 import threading
 import time
@@ -79,6 +82,12 @@ validate_international = RegexValidator(
 _client_ip: ContextVar[str | None] = ContextVar("django_smstunnel_client_ip", default=None)
 _warned_about_proxy = False
 
+# Sending from public forms: a few threads and a short queue per process, so a flood can't pile up threads or memory.
+_WORKERS = 4
+_QUEUE_SIZE = 32
+_FULL_LOG_EVERY = 60.0
+_EXIT_WAIT = 5.0
+
 
 class CodeResult(enum.Enum):
     """What happened to a code handed to :func:`send_code`."""
@@ -89,7 +98,7 @@ class CodeResult(enum.Enum):
     BACKGROUND = "background"
     #: The number is not in international format. Nothing was sent.
     BAD_NUMBER = "bad_number"
-    #: A limit was reached. Nothing was sent.
+    #: A limit was reached, or too many codes are already waiting to go out. Nothing was sent.
     LIMITED = "limited"
     #: SMSTunnel refused the text, or the setup is wrong. Nothing was sent.
     FAILED = "failed"
@@ -180,7 +189,8 @@ def send_code(to: str, text: str, *, ip: str | None = None, background: bool = F
     :param text: the text, with the code as 4 to 10 digits standing on their own.
     :param ip: the visitor's IP; default the one :class:`ClientIPMiddleware` saw. Without one, only the limits per
         number and for the project apply.
-    :param background: send from a thread and return at once.
+    :param background: hand it to the worker threads and return at once. When too many codes are already waiting,
+        nothing is sent and the site owner finds it in the log.
     """
     if not is_international(to):
         logger.warning("SMSTunnel: a sign-in code was not sent: the number is not in international format.")
@@ -188,26 +198,105 @@ def send_code(to: str, text: str, *, ip: str | None = None, background: bool = F
     address = ip if ip is not None else _client_ip.get()
     if not background:
         return _limit_and_deliver(to, text, address)
-    # The counting happens in the thread too: the cache is a network call on most sites, and a number with an account
+    # The counting happens in the worker too: the cache is a network call on most sites, and a number with an account
     # must take no longer to answer than one without.
-    try:
-        threading.Thread(target=_in_background, args=(to, text, address), name="django-smstunnel-code").start()
-    except RuntimeError:
-        logger.error("SMSTunnel: a sign-in code was not sent: no thread could be started.")
-        return CodeResult.FAILED
-    return CodeResult.BACKGROUND
+    return _pool.submit(to, text, address)
 
 
-def _in_background(to: str, text: str, ip: str | None) -> None:
-    try:
-        _limit_and_deliver(to, text, ip)
-    finally:
-        connections.close_all()  # A database cache opens a connection for this thread.
+class _SendPool:
+    """A fixed set of worker threads reading a bounded queue."""
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[tuple[str, str, str | None]] = queue.Queue(_QUEUE_SIZE)
+        self._lock = threading.Lock()
+        self._workers: list[threading.Thread] = []
+        self._dropped = 0
+        self._last_report = -_FULL_LOG_EVERY
+
+    def submit(self, to: str, text: str, ip: str | None) -> CodeResult:
+        """Queues one code without ever waiting. When the queue is full, nothing is sent."""
+        if not self._has_workers():
+            logger.error("SMSTunnel: a sign-in code was not sent: no thread could be started.")
+            return CodeResult.FAILED
+        try:
+            self._queue.put_nowait((to, text, ip))
+        except queue.Full:
+            self._report_full()
+            return CodeResult.LIMITED
+        return CodeResult.BACKGROUND
+
+    def drain(self, timeout: float) -> bool:
+        """Waits up to ``timeout`` seconds for the queued codes. ``True`` when none is left."""
+        deadline = time.monotonic() + timeout
+        while self._queue.unfinished_tasks:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
+    def _has_workers(self) -> bool:
+        with self._lock:
+            self._workers = [worker for worker in self._workers if worker.is_alive()]
+            while len(self._workers) < _WORKERS:
+                worker = threading.Thread(target=self._work, name="django-smstunnel-code", daemon=True)
+                try:
+                    worker.start()
+                except RuntimeError:  # The process is shutting down, or can't start more threads.
+                    break
+                self._workers.append(worker)
+            return bool(self._workers)
+
+    def _work(self) -> None:
+        while True:
+            to, text, ip = self._queue.get()
+            try:
+                try:
+                    _limit_and_deliver(to, text, ip)
+                finally:
+                    connections.close_all()  # A database cache opens a connection for this thread.
+            except Exception as error:
+                logger.error("SMSTunnel: a sign-in code was not sent (%s).", type(error).__name__)
+            finally:
+                self._queue.task_done()
+
+    def _report_full(self) -> None:
+        """At most one line a minute: a flood must not fill the log as well."""
+        with self._lock:
+            self._dropped += 1
+            now = time.monotonic()
+            if now - self._last_report < _FULL_LOG_EVERY:
+                return
+            dropped, self._dropped, self._last_report = self._dropped, 0, now
+        logger.error(
+            "SMSTunnel: %s sign-in code(s) were not sent: too many are already waiting to go out. Check that SMSTunnel "
+            "answers, and whether someone is flooding your sign-in form.",
+            dropped,
+        )
+
+
+_pool = _SendPool()
+
+
+def _new_pool_after_fork() -> None:
+    """A forked process has no worker threads, and must not send the codes its parent still has queued."""
+    global _pool
+    _pool = _SendPool()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_new_pool_after_fork)
+atexit.register(lambda: _pool.drain(_EXIT_WAIT))
 
 
 def _limit_and_deliver(to: str, text: str, ip: str | None) -> CodeResult:
     try:
         reached = _limit_reached(to, ip)
+    except _CounterNotKeptError:
+        logger.error(
+            "SMSTunnel: a sign-in code was not sent: the cache keeps nothing (DummyCache?), so the limits can't be "
+            "counted. Use a real cache: Redis, Memcached or the database."
+        )
+        return CodeResult.FAILED
     except Exception as error:
         # With no way to count, the safe side is to send nothing: an open form could drain the SIM.
         logger.error(  # No traceback: it could carry the number.
@@ -285,6 +374,10 @@ def _limit_reached(to: str, ip: str | None) -> str | None:
     return None
 
 
+class _CounterNotKeptError(Exception):
+    """The cache did not keep a counter, so no limit can be enforced."""
+
+
 def _count(scope: str, name: str, rate: Rate) -> bool:
     now = int(time.time())
     window = now // rate.seconds
@@ -293,9 +386,12 @@ def _count(scope: str, name: str, rate: Rate) -> bool:
     cache.add(key, 0, timeout)
     try:
         count = cache.incr(key)
-    except ValueError:  # It expired between the two calls.
+    except ValueError:  # It expired between the two calls, or this cache keeps nothing.
         cache.set(key, 1, timeout)
-        count = 1
+        stored = cache.get(key)
+        if stored is None:
+            raise _CounterNotKeptError from None
+        count = int(stored)
     return bool(count <= rate.amount)
 
 
@@ -303,8 +399,10 @@ def client_ip(request: HttpRequest, *, candidate: str | None = None) -> str | No
     """The visitor's IP for the per-IP limit, or ``None`` when it can't be known.
 
     ``SMSTUNNEL_CLIENT_IP`` (a function or its dotted path, taking the request) decides when it is set. Otherwise this
-    is ``candidate`` or ``REMOTE_ADDR``, unless the request came through a local proxy: ``REMOTE_ADDR`` is then the
-    proxy's, the same for every visitor, and counting it would lock everyone out at once.
+    is ``candidate`` or ``REMOTE_ADDR``. A request from a private address with ``X-Forwarded-For`` gets ``None``, which
+    turns the per-IP limit off: ``REMOTE_ADDR`` may be a proxy's, the same for every visitor, so counting it could lock
+    everyone out at once, and the header can't be trusted, because anyone on that network can write it. The limits per
+    number and for the project don't depend on any of this.
     """
     resolver = getattr(settings, "SMSTUNNEL_CLIENT_IP", None)
     if resolver is not None:
@@ -326,10 +424,14 @@ def client_ip(request: HttpRequest, *, candidate: str | None = None) -> str | No
 
 
 def _is_private(address: str) -> bool:
+    """Not a public address. A public IPv4 visitor on a dual-stack socket arrives as ``::ffff:a.b.c.d``."""
     try:
-        return ipaddress.ip_address(address).is_private
+        parsed = ipaddress.ip_address(address)
     except ValueError:
         return False
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        parsed = parsed.ipv4_mapped
+    return not parsed.is_global
 
 
 def _network(value: str) -> str | None:
@@ -350,8 +452,10 @@ def _warn_about_proxy() -> None:
     if not _warned_about_proxy:
         _warned_about_proxy = True
         logger.warning(
-            "SMSTunnel: requests come through a proxy, so the per-IP limit is skipped. Set SMSTUNNEL_CLIENT_IP to a "
-            "function that reads the visitor's IP (with django-allauth: ALLAUTH_TRUSTED_PROXY_COUNT)."
+            "SMSTunnel: the per-IP limit on sign-in codes is OFF. Requests arrive from a private address with an "
+            "X-Forwarded-For header, which this app can't verify. It stays off until you set SMSTUNNEL_CLIENT_IP to a "
+            "function that returns the visitor's IP (with django-allauth, ALLAUTH_TRUSTED_PROXY_COUNT also works). The "
+            "limits per number and for the whole project still apply."
         )
 
 

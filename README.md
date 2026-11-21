@@ -169,7 +169,7 @@ cancel_scheduled(booking.reminder_id)  # the booking was canceled while the text
 | `SMSTUNNEL_BASE_URL` | `"https://smstunnel.io"` | Change it only for a test server. |
 | `SMSTUNNEL_TIMEOUT` | `30` | Seconds for each request. |
 | `SMSTUNNEL_SIGNIN_LIMITS` | see [Limits](#limits) | How many sign-in codes may go out per number, per IP and for the whole project. |
-| `SMSTUNNEL_CLIENT_IP` | `None` | A function (or its dotted path) that takes the request and returns the visitor's IP, for a site behind a proxy. |
+| `SMSTUNNEL_CLIENT_IP` | `None` | A function (or its dotted path) that takes the request and returns the visitor's IP. Behind a proxy, the limit per IP is off until this is set. |
 | `SMSTUNNEL_SIGNIN_BACKGROUND` | `True` | Public sign-in forms answer before the text is sent. Turn it off only on platforms that stop the process after each answer. |
 | `SMSTUNNEL_OTP_TOKEN_VALIDITY` | `300` | Seconds a django-otp code works. |
 | `SMSTUNNEL_OTP_COOLDOWN` | `60` | Seconds before a django-otp device can send a new code. |
@@ -352,8 +352,17 @@ SMSTUNNEL_SIGNIN_LIMITS = {
 
 Write a rate like `3/15m`, `5/h` or `10/d`, and `None` to turn one limit off. When a limit is reached, no text goes out, the page doesn't change, and a warning goes to the `django_smstunnel.signin` log.
 
-- **Use a cache shared by your workers** (Redis, Memcached or the database). With Django's default local-memory cache each worker counts on its own. With `DummyCache` nothing is counted, and `manage.py check` warns. If the cache is down, no code is sent.
-- **Behind a proxy**, tell it where the visitor's IP is, with `SMSTUNNEL_CLIENT_IP = "myproject.utils.client_ip"` (with django-allauth, `ALLAUTH_TRUSTED_PROXY_COUNT` is enough). Until then the limit per IP is skipped, because every visitor would seem to come from the proxy. The other two limits still apply.
+- **Use a cache shared by your workers** (Redis, Memcached or the database). With Django's default local-memory cache each worker counts on its own. `DummyCache` keeps nothing, so **no sign-in code is sent** until you use a real cache: `manage.py check` warns and the log says why. If the cache is down, no code is sent either.
+- **Behind a proxy, the limit per IP is off until you set `SMSTUNNEL_CLIENT_IP`.** A request from a private address with an `X-Forwarded-For` header may come from a real proxy or from anyone on that network writing the header, and your app can't tell which. Counting the proxy's address would lock out every visitor at once, so the limit stays off and the log says so. The limits per number and for the project are never affected.
+
+  ```python
+  # settings.py, behind an nginx with: proxy_set_header X-Real-IP $remote_addr;
+  SMSTUNNEL_CLIENT_IP = lambda request: request.headers.get("X-Real-IP")
+  ```
+
+  Let only the proxy reach your app, since a header is only as trustworthy as whoever can send it. With django-allauth, `ALLAUTH_TRUSTED_PROXY_COUNT` works too.
+- **Behind a CDN that connects from public addresses**, set it as well. Otherwise each CDN address counts as one visitor, and everyone behind it shares that limit.
+- **A flood can't pile up work.** Public forms hand each code to 4 worker threads with a queue of 32, per process. When the queue is full, no text goes out, the page doesn't change, and the log says so.
 
 ## Errors
 
@@ -432,7 +441,7 @@ from django_smstunnel import get_client
 client = get_client()
 
 status = client.get_message_status(result.message_id)
-status.status       # "pending", "sent", "delivered" or "failed"
+status.status       # "pending", "sent" or "failed"; "sent" is the last good status
 status.is_final     # True once it will not change any more
 
 for phone in client.get_devices():
@@ -440,6 +449,8 @@ for phone in client.get_devices():
 
 client.get_usage().remaining  # today's quota left
 ```
+
+`sent` means your phone sent the text. No text reaches `delivered` today: SMSTunnel doesn't confirm that a text arrived.
 
 Reading the texts your phone received needs a key you allowed to (**Can also read received texts**); see `client.get_received_messages()` in the [smstunnel README](https://pypi.org/project/smstunnel/). You can also have them forwarded to a URL of your app: **Apps → the key → Forward received texts**.
 
