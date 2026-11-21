@@ -3,7 +3,7 @@
 All notable changes to `django-smstunnel` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
-## [1.2.0] - Unreleased
+## [1.2.0] - 2026-11-21
 
 Everything here is optional: a project that doesn't use it runs as with 1.1, and the package still imports without
 these hosts installed.
